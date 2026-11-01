@@ -72,3 +72,42 @@ Scenarios and actual outcomes:
 Finding: day-mode muted text #718096 has contrast 4.02:1 on white and 3.76:1 on the solid cream base, below WCAG AA's 4.5:1 threshold for normal-sized text. Decorative gradients were not exhaustively sampled. The requested exact palette was not changed during testing. Primary text/button contrast passed the same numerical threshold in both themes; this does not constitute a full WCAG audit.
 
 Limits: actual admin moderation requires an authorized admin account and was not exercised; real login/logout, bookmark/like persistence and report moderation were not newly verified in this round. Prior creation, image upload, ordering, publishing, profile save, draft deletion and history persistence results remain the earlier DB-backed evidence, not fresh results. No production deployment, real-device browser matrix, load test or platform scan gate was performed.
+
+## Five-feature real integration (2026-11-01, current round)
+
+Stage: targeted local integration of avatar upload, homepage continue reading, public writer profiles/works, derived chapter notifications, and privacy/terms/contact pages. These results are newly executed browser/API/MariaDB tests, distinct from the earlier mocked frontend rendering checks. They are not production acceptance or a full regression of every existing workflow.
+
+### Environment and schema
+
+- Every direct SQL connection first executed SELECT DATABASE() and verified db_std10_p01. Only read-only inspections were executed directly in this round; test writes used real application APIs under newly created QA accounts.
+- The parent reported applying users.avatar_image_url VARCHAR(255) NOT NULL DEFAULT ''. The column was independently observed in information_schema; no ALTER, migration file or applied-history changes were made here. Platform migration history is still unknown.
+- A temporary attached server loaded the current server.js on 127.0.0.1:31109. PORT/HOST overrides existed only in that process; no managed env or .env values were changed or printed. GET /api/health returned 200 with project p01, database ready and schema ready.
+- Browser tests used 127.0.0.1 to isolate cookies from the owner's localhost context. No existing user data was edited. A separate browser-context ownership test could not start because browser storage affinity disallowed context.newPage; the equivalent cross-account API test was then executed using an independent Node HTTP cookie jar.
+
+### New scenarios and actual evidence
+
+- Registration/setup: the real registration form created writer 16 (featureqa1793511711143). Independent API registration created reader 17. Both are newly generated QA identities; no credentials were printed.
+- Avatar create/read/update: an original canvas-generated PNG was submitted through the profile upload form. Expected a sanitized, owned image persisted across refresh; actual image decoded at 96 x 96, survived a full reload, and the users.avatar_image_url value matched the images record. A second original image replaced the writer avatar through the same UI and survived another full reload. Current writer avatar: /images/3b12148c-4492-4e6b-81e4-28ce0669282d.webp, 506 bytes, WebP, no EXIF, owner 16; tracked bytes equaled filesystem bytes. Reader avatar upload returned 201 and persisted through a fresh session read; DB confirmed owner 17, WebP, no EXIF, 78 tracked/filesystem bytes.
+- Image access/ownership: unauthenticated reads of the writer profile and its published avatar returned 200. Attempting to delete the original own image while referenced returned 409; a different isolated reader attempting to delete it returned 404. Its use as the QA series cover remained intact after avatar replacement. No existing user images were targeted.
+- Writer projection: clicking the series writer link opened #/writer/16, decoded the avatar and displayed only the QA writer's published series 8. The real public API returned id, writer_name, avatar_image_url, donation_url, donation_qr_url and works, without email or history. The public projection matched the replacement avatar.
+- Notification setup: real authenticated APIs created QA series 8 and chapters 8/9 with original generated page images. Chapter 8 was published before the real UI bookmark action; chapter 9 was initially a draft. Expected no notifications for pre-follow chapters or drafts; actual notification list was empty in both cases.
+- Notification publish/read: publishing chapter 9 after bookmarking produced exactly its new-chapter notification. The real notification UI linked to #/read/9. Opening it and scrolling its page caused the reader to persist page 1. A subsequent real API read returned an empty notification list, as expected for the now-read chapter. The notification is cleared by reading history, not a separate seen marker; no push delivery or mark-all-read feature exists.
+- Continue reading: after that reader action, the homepage showed the QA series/chapter and page 1, and preserved the entry after full reload. Direct DB reads confirmed reading_history(user_id=16,chapter_id=9,page_order=1), bookmark(user_id=16,series_id=8), and both chapters belonging to series 8 with published_at set.
+- Policy/contact navigation: real footer clicks opened privacy, terms and contact at mobile width 320 and updated document titles. Contact explicitly states the absence of a confirmed general contact mailbox/form; it points to the existing reporting workflow rather than pretending to send a message. No new report was submitted.
+- Responsive acceptance: seven affected routes (home, own profile, public writer, notifications, privacy, terms, contact) at widths 320, 390 and 1440: final 21 scenarios had zero horizontal-overflow findings. Original checks found narrow writer-name and own-profile-header overflow at 320; fixed the affected flex child sizing/wrapping in public/style.css and added a scoped profile-account hook in public/index.js. Reloaded assets before rerunning; final 21 scenarios passed. A mobile public-writer screenshot was also inspected. The layout-only fix did not alter payloads/storage, so DB workflows were not repeated solely for that CSS change.
+- node --check server.js and node --check public/index.js passed; editor Problems reported no errors for those files and public/style.css. git diff --check passed (only normal LF/CRLF working-copy notices).
+
+### Persistence and limits
+
+- QA users 16/17, QA series 8, published chapters 8/9, their images, bookmark and chapter-9 history remain as evidence. No existing records were reset, overwritten or deleted. Successful deletion of unused replacement images, quota exhaustion, animated-image conversion and complete moderation flows were not newly exercised.
+- The temporary 31109 helper was stopped after testing. No unrelated process was killed or persistent server replaced.
+- The existing 127.0.0.1:31101 server responded to health with 200, but /api/writers/16, /api/continue-reading and /api/notifications all returned 404: it has not loaded these backend routes and requires an owner-controlled restart. Health alone does not establish current-code readiness. The real integration results above apply to the temporary current-code server, not that older runtime.
+- No commit, push, deployment, managed-env update, platform scan gate or public route verification was performed. Platform migration history still needs reconciliation by the parent; do not rerun the already-present ALTER blindly.
+
+## Current local runtime follow-up
+
+- Restarted the identified old Node server on port 31101 with the current code after the integration run.
+- Fresh probes on 31101: /api/health 200; /api/writers/16 200; unauthenticated /api/continue-reading and /api/notifications 401 as expected.
+- Full feature integration evidence above remains from the isolated temporary server on 31109; these follow-up probes verify current route readiness, not a second full E2E run.
+- No Git commit, push, or platform Deploy performed for this feature change.
+

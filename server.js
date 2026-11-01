@@ -64,7 +64,7 @@ const fail = (status, message) => { const error = new Error(message); error.stat
 const ok = (res, data, status = 200) => res.status(status).json({ data });
 const idOf = value => { const id = Number(value); if (!Number.isSafeInteger(id) || id < 1 || id > 4294967295) fail(400, 'รหัสข้อมูลไม่ถูกต้อง'); return id; };
 const text = (value, max, min = 0) => { if (typeof value !== 'string' || value.trim().length < min || value.trim().length > max) fail(400, 'ข้อมูลไม่ครบหรือยาวเกินกำหนด'); return value.trim(); };
-const userFields = 'id,username,email,role,pen_name,donation_url,donation_qr_url';
+const userFields = 'id,username,email,role,pen_name,donation_url,donation_qr_url,avatar_image_url';
 const genres = ['แฟนตาซี', 'ชีวิตประจำวัน', 'ผจญภัย', 'โรแมนซ์', 'ลึกลับ', 'ตลก', 'อื่น ๆ'];
 const publicSeries = 's.hidden=0 AND u.suspended=0';
 const seriesFields = `s.id,s.writer_id,s.title,s.synopsis,s.genre,s.tags,s.status,s.cover_image_url,s.views,s.updated_at,COALESCE(NULLIF(u.pen_name,''),u.username) AS writer_name,(SELECT COUNT(*) FROM chapters c WHERE c.series_id=s.id AND c.published_at IS NOT NULL) AS chapter_count`;
@@ -159,7 +159,7 @@ async function readableChapter(chapterId, userId = null) {
 }
 
 const requiredSchema = {
-  users: 'id,username,email,password_hash,role,pen_name,donation_url,donation_qr_url,guidelines_version,guidelines_accepted_at,suspended,created_at',
+  users: 'id,username,email,password_hash,role,pen_name,donation_url,donation_qr_url,guidelines_version,guidelines_accepted_at,suspended,created_at,avatar_image_url',
   sessions: 'token_hash,user_id,expires_at',
   series: 'id,writer_id,title,synopsis,genre,tags,status,cover_image_url,hidden,views,created_at,updated_at',
   chapters: 'id,series_id,chapter_number,title,published_at,created_at',
@@ -318,6 +318,22 @@ app.put('/api/history',auth,async(req,res) => {
   await query('INSERT INTO reading_history(user_id,chapter_id,page_order) VALUES(?,?,?) ON DUPLICATE KEY UPDATE page_order=VALUES(page_order),updated_at=UTC_TIMESTAMP()',[req.user.id,chapterId,pageOrder]);
   ok(res,{saved:true});
 });
+app.get('/api/continue-reading',auth,async(req,res) => {
+  const history=await query(`SELECT h.chapter_id,h.page_order,c.series_id,c.title,s.title AS series_title,s.cover_image_url FROM reading_history h JOIN chapters c ON c.id=h.chapter_id JOIN series s ON s.id=c.series_id JOIN users u ON u.id=s.writer_id WHERE h.user_id=? AND ${publicSeries} AND c.published_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM reading_history newer JOIN chapters nc ON nc.id=newer.chapter_id WHERE newer.user_id=h.user_id AND nc.series_id=c.series_id AND nc.published_at IS NOT NULL AND (newer.updated_at>h.updated_at OR (newer.updated_at=h.updated_at AND newer.chapter_id>h.chapter_id))) ORDER BY h.updated_at DESC,h.chapter_id DESC LIMIT 12`,[req.user.id]);
+  ok(res,history);
+});
+app.get('/api/writers/:id',async(req,res) => {
+  const id=idOf(req.params.id);
+  const users=await query("SELECT id,COALESCE(NULLIF(pen_name,''),username) AS writer_name,avatar_image_url,donation_url,donation_qr_url FROM users WHERE id=? AND suspended=0 AND role IN ('writer','admin')",[id]);
+  if(!users.length) fail(404,'Writer not found');
+  const works=await query(`SELECT ${seriesFields} FROM series s JOIN users u ON u.id=s.writer_id WHERE s.writer_id=? AND ${publicSeries} AND EXISTS(SELECT 1 FROM chapters c WHERE c.series_id=s.id AND c.published_at IS NOT NULL) ORDER BY s.updated_at DESC,s.id DESC LIMIT 100`,[id]);
+  ok(res,{...users[0],works});
+});
+// Bookmarks are the existing follow list; reading a chapter clears its notification.
+app.get('/api/notifications',auth,async(req,res) => {
+  const items=await query(`SELECT c.id AS chapter_id,c.chapter_number,c.title,c.published_at,s.id AS series_id,s.title AS series_title FROM bookmarks b JOIN series s ON s.id=b.series_id JOIN users u ON u.id=s.writer_id JOIN chapters c ON c.series_id=s.id WHERE b.user_id=? AND ${publicSeries} AND c.published_at IS NOT NULL AND c.published_at>=b.created_at AND NOT EXISTS(SELECT 1 FROM reading_history h WHERE h.user_id=b.user_id AND h.chapter_id=c.id) ORDER BY c.published_at DESC,c.id DESC LIMIT 100`,[req.user.id]);
+  ok(res,items);
+});
 app.get('/api/profile',auth,async(req,res) => {
   const bookmarks=await query(`SELECT ${seriesFields} FROM bookmarks b JOIN series s ON s.id=b.series_id JOIN users u ON u.id=s.writer_id WHERE b.user_id=? AND ${publicSeries} ORDER BY b.created_at DESC LIMIT 100`,[req.user.id]);
   const history=await query(`SELECT h.chapter_id,h.page_order,c.series_id,c.title,s.title AS series_title FROM reading_history h JOIN chapters c ON c.id=h.chapter_id JOIN series s ON s.id=c.series_id JOIN users u ON u.id=s.writer_id WHERE h.user_id=? AND ${publicSeries} AND c.published_at IS NOT NULL ORDER BY h.updated_at DESC LIMIT 100`,[req.user.id]);
@@ -440,7 +456,7 @@ function admitImage(req,res,next) {
     });
   } catch(error) { next(error); }
 }
-async function storeImage(req,chapterId=null) {
+async function storeImage(req,chapterId=null,avatar=false) {
   if(!Buffer.isBuffer(req.body)||!req.body.length) fail(400,'รองรับ PNG, JPG, GIF และ WebP เท่านั้น');
   let db; let locked=false; let filePath; let fileCreated=false; let commitAttempted=false;
   try {
@@ -474,6 +490,7 @@ async function storeImage(req,chapterId=null) {
       const [insert]=await db.execute('INSERT INTO chapter_pages(chapter_id,image_id,page_order) VALUES(?,?,?)',[chapterId,uuid,order]);
       result={...result,id:insert.insertId,page_order:order};
     }
+    if(avatar) await db.execute('UPDATE users SET avatar_image_url=? WHERE id=?',[url,req.user.id]);
     commitAttempted=true;
     await db.commit(); fileCreated=false; return result;
   } catch(error) {
@@ -486,19 +503,22 @@ async function storeImage(req,chapterId=null) {
     if(db) { if(locked) await db.execute("SELECT RELEASE_LOCK('p01_image_quota')").catch(()=>{}); db.release(); }
   }
 }
-app.delete('/api/images/:uuid',writer,async(req,res)=> {
+app.delete('/api/images/:uuid',auth,async(req,res)=> {
   const uuid=req.params.uuid;
   if(!/^[a-f0-9-]{36}$/.test(uuid)) fail(400,'รหัสรูปไม่ถูกต้อง');
   await transaction(async db=> {
     const [rows]=await db.execute('SELECT image_url FROM images WHERE id=? AND user_id=? FOR UPDATE',[uuid,req.user.id]);
     if(!rows.length) fail(404,'ไม่พบรูปของคุณ');
     const url=rows[0].image_url;
-    const [refs]=await db.execute('SELECT (SELECT COUNT(*) FROM series WHERE cover_image_url=?)+(SELECT COUNT(*) FROM users WHERE donation_qr_url=?)+(SELECT COUNT(*) FROM chapter_pages WHERE image_id=?) AS count',[url,url,uuid]);
+    const [refs]=await db.execute('SELECT (SELECT COUNT(*) FROM series WHERE cover_image_url=?)+(SELECT COUNT(*) FROM users WHERE donation_qr_url=? OR avatar_image_url=?)+(SELECT COUNT(*) FROM chapter_pages WHERE image_id=?) AS count',[url,url,url,uuid]);
     if(Number(refs[0].count)) fail(409,'รูปนี้ยังถูกใช้งานอยู่');
     await db.execute('DELETE FROM images WHERE id=?',[uuid]);
   });
   await fsp.unlink(path.join(imageRoot,`${uuid}.webp`)).catch(error=>{if(error.code!=='ENOENT') console.error('Image cleanup failed:',error.code);});
   ok(res,{deleted:true});
+});
+app.post('/api/profile/avatar',auth,admitImage,async(req,res)=> {
+  try { ok(res,await storeImage(req,null,true),201); } finally { req.releaseImage(); }
 });
 app.post('/api/images',writer,admitImage,async(req,res)=> {
   try { ok(res,await storeImage(req),201); } finally { req.releaseImage(); }
@@ -541,7 +561,7 @@ app.get('/images/:file',async(req,res)=> {
     limit(req,'image-reads',300,60000);
     if(!/^[a-f0-9-]{36}\.webp$/.test(req.params.file)) fail(404,'ไม่พบรูป');
     const url=`/images/${req.params.file}`;
-    const publicRows=await query(`SELECT i.id FROM images i WHERE i.image_url=? AND (EXISTS(SELECT 1 FROM series s JOIN users u ON u.id=s.writer_id WHERE s.cover_image_url=i.image_url AND ${publicSeries} AND EXISTS(SELECT 1 FROM chapters c WHERE c.series_id=s.id AND c.published_at IS NOT NULL)) OR EXISTS(SELECT 1 FROM users u WHERE u.donation_qr_url=i.image_url AND u.suspended=0) OR EXISTS(SELECT 1 FROM chapter_pages p JOIN chapters c ON c.id=p.chapter_id JOIN series s ON s.id=c.series_id JOIN users u ON u.id=s.writer_id WHERE p.image_id=i.id AND c.published_at IS NOT NULL AND ${publicSeries}))`,[url]);
+    const publicRows=await query(`SELECT i.id FROM images i WHERE i.image_url=? AND (EXISTS(SELECT 1 FROM series s JOIN users u ON u.id=s.writer_id WHERE s.cover_image_url=i.image_url AND ${publicSeries} AND EXISTS(SELECT 1 FROM chapters c WHERE c.series_id=s.id AND c.published_at IS NOT NULL)) OR EXISTS(SELECT 1 FROM users u WHERE (u.donation_qr_url=i.image_url OR u.avatar_image_url=i.image_url) AND u.suspended=0) OR EXISTS(SELECT 1 FROM chapter_pages p JOIN chapters c ON c.id=p.chapter_id JOIN series s ON s.id=c.series_id JOIN users u ON u.id=s.writer_id WHERE p.image_id=i.id AND c.published_at IS NOT NULL AND ${publicSeries}))`,[url]);
     if(!publicRows.length) {
       const token=cookies(req).kt_session || '';
       const owner=await query('SELECT i.id FROM images i JOIN sessions se ON se.user_id=i.user_id JOIN users u ON u.id=i.user_id WHERE i.image_url=? AND se.token_hash=? AND se.expires_at>UTC_TIMESTAMP() AND u.suspended=0',[url,hash(token)]);
